@@ -1,0 +1,14 @@
+{
+  "extensions": [
+    {
+      "id": "node-metadata",
+      "label": "Node-Metadaten",
+      "order": 110,
+      "hash": "node-metadata",
+      "entry": "/ui/extensions/node-metadata/index.js",
+      "endpoints": [
+        "/node-metadata-status.json"
+      ]
+    }
+  ]
+}
