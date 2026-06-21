@@ -1,4 +1,4 @@
-FROM ghcr.io/freifunkstuff/ffdd-node:master
+FROM ghcr.io/freifunkstuff/ffdd-node:v1.0.0
 
 RUN apk add --no-cache py3-yaml
 
