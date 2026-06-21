@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from .config import MetadataCollectorConfig
 from .fetcher import SysinfoFetcher
 from .meshviewer import build_community_meshviewer_documents, build_meshviewer_document
+from .metrics_exporter import VictoriametricsExporter
 from .models import NodeState
 from .node_list_sources import BmxdNodeListSource, FileJsonNodeListSource, HttpJsonNodeListSource, NodeListSource, NodeListSourceError
 from .scheduler import PollScheduler, classify_poll_mode, compute_next_poll_at, fetch_timeout_for_mode
@@ -25,6 +26,7 @@ class MetadataCollectorApp:
         self.source = self._create_source()
         self.fetcher = SysinfoFetcher(user_agent=config.request_user_agent)
         self.store = self._create_store()
+        self.exporter = self._create_exporter()
         self.scheduler = PollScheduler()
         self._scheduler_wakeup = asyncio.Event()
         self._stop_event = asyncio.Event()
@@ -60,6 +62,14 @@ class MetadataCollectorApp:
             asyncio.create_task(self._snapshot_loop(), name="snapshot-loop"),
             asyncio.create_task(self._summary_loop(), name="summary-loop"),
         ]
+        if self.exporter is not None:
+            logger.info(
+                "metrics export enabled url=%s interval=%s communities=%s",
+                self.config.victoriametrics_url,
+                self.config.metrics_interval_seconds,
+                ",".join(self.config.metrics_communities) or "all",
+            )
+            tasks.append(asyncio.create_task(self._metrics_loop(), name="metrics-loop"))
         try:
             await self._stop_event.wait()
         finally:
@@ -112,6 +122,19 @@ class MetadataCollectorApp:
                 node_status_dir=self.config.node_status_dir,
             )
         raise ValueError(f"unsupported METADATA_COLLECTOR_STORAGE: {self.config.storage_backend}")
+
+    def _create_exporter(self) -> VictoriametricsExporter | None:
+        if not self.config.victoriametrics_url:
+            return None
+        return VictoriametricsExporter(
+            import_url=self.config.victoriametrics_url,
+            username=self.config.victoriametrics_username or None,
+            password=self.config.victoriametrics_password or None,
+            user_agent=self.config.request_user_agent,
+            node_max_age_seconds=self.config.online_window_seconds,
+            link_max_age_seconds=self.config.metrics_link_max_age_seconds,
+            communities=frozenset(c.lower() for c in self.config.metrics_communities),
+        )
 
     def _bootstrap_scheduler(self) -> int:
         now = _utcnow()
@@ -206,6 +229,19 @@ class MetadataCollectorApp:
         while True:
             await asyncio.sleep(self.config.log_summary_interval_seconds)
             self._log_summary()
+
+    async def _metrics_loop(self) -> None:
+        assert self.exporter is not None
+        while True:
+            await asyncio.sleep(self.config.metrics_interval_seconds)
+            states = self.store.list_node_states()
+            try:
+                pushed = await self.exporter.export(states)
+            except Exception:
+                logger.exception("metrics export failed")
+                continue
+            if pushed:
+                logger.debug("metrics pushed nodes=%s", len(states))
 
     async def _write_outputs(self, reason: str | None = None) -> None:
         generated_at = _utcnow().isoformat()

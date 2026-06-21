@@ -51,6 +51,10 @@ def _get_config_int(defaults: dict[str, object], env_name: str, fallback: int) -
     return int(_get_config_value(defaults, env_name, str(fallback)))
 
 
+def _parse_communities(value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
 @dataclass(slots=True, frozen=True)
 class MetadataCollectorConfig:
     source_type: str
@@ -89,6 +93,12 @@ class MetadataCollectorConfig:
     meshviewer_online_window_seconds: float
     meshviewer_hide_temp_after_seconds: float
     meshviewer_hide_stale_after_days: float
+    victoriametrics_url: str
+    victoriametrics_username: str
+    victoriametrics_password: str
+    metrics_interval_seconds: float
+    metrics_link_max_age_seconds: float
+    metrics_communities: tuple[str, ...]
 
     @classmethod
     def from_env(cls) -> "MetadataCollectorConfig":
@@ -160,6 +170,12 @@ class MetadataCollectorConfig:
             meshviewer_online_window_seconds=_get_config_float(defaults, "METADATA_COLLECTOR_MESHVIEWER_ONLINE_WINDOW_SECONDS", 600.0),
             meshviewer_hide_temp_after_seconds=_get_config_float(defaults, "METADATA_COLLECTOR_MESHVIEWER_HIDE_TEMP_AFTER_SECONDS", 1800.0),
             meshviewer_hide_stale_after_days=_get_config_float(defaults, "METADATA_COLLECTOR_MESHVIEWER_HIDE_STALE_AFTER_DAYS", 30.0),
+            victoriametrics_url=_get_config_value(defaults, "METADATA_COLLECTOR_VICTORIAMETRICS_URL", ""),
+            victoriametrics_username=_get_config_value(defaults, "METADATA_COLLECTOR_VICTORIAMETRICS_USERNAME", ""),
+            victoriametrics_password=_get_config_value(defaults, "METADATA_COLLECTOR_VICTORIAMETRICS_PASSWORD", ""),
+            metrics_interval_seconds=_get_config_float(defaults, "METADATA_COLLECTOR_METRICS_INTERVAL", 300.0),
+            metrics_link_max_age_seconds=_get_config_float(defaults, "METADATA_COLLECTOR_METRICS_LINK_MAX_AGE_SECONDS", 900.0),
+            metrics_communities=_parse_communities(_get_config_value(defaults, "METADATA_COLLECTOR_METRICS_COMMUNITIES", "")),
         )
 
     def ensure_directories(self) -> None:
