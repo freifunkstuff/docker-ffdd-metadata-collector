@@ -235,6 +235,24 @@ class SysinfoParserTests(unittest.TestCase):
         self.assertEqual("18", result.version)
         self.assertEqual("mobile", result.info["node_type"])
 
+    def test_parse_decodes_urlencoded_contact_fields(self) -> None:
+        payload = self.make_payload()
+        payload["data"]["contact"].update(
+            {
+                "name": "Glas+%26+Bohne",
+                "location": "Leipzig+Sued",
+                "email": "foo%2Bbar%40example.org",
+                "note": "Cafe%2BRouter",
+            }
+        )
+
+        result = parse_payload(payload)
+
+        self.assertEqual("Glas & Bohne", result.info["name"])
+        self.assertEqual("Leipzig Sued", result.info["location"])
+        self.assertEqual("foo+bar@example.org", result.info["contact_email"])
+        self.assertEqual("Cafe+Router", result.info["note"])
+
 
 if __name__ == "__main__":
     unittest.main()

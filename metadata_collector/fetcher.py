@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from socket import timeout as SocketTimeout
 from time import monotonic
 from json import JSONDecodeError
 from urllib.error import HTTPError, URLError
@@ -52,7 +53,18 @@ class SysinfoFetcher:
                 result_kind="http_error",
                 timeout_ms=int(timeout_seconds * 1000),
             )
-        except (URLError, TimeoutError, JSONDecodeError, ValueError) as exc:
+        except URLError as exc:
+            return FetchOutcome(
+                node_id=node_id,
+                primary_ip=primary_ip,
+                fetched_at=fetched_at,
+                success=False,
+                error=f"{type(exc).__name__}: {exc}",
+                duration_ms=_elapsed_ms(started_at),
+                result_kind=_result_kind_for_exception(exc),
+                timeout_ms=int(timeout_seconds * 1000),
+            )
+        except (TimeoutError, SocketTimeout, JSONDecodeError, ValueError, OSError) as exc:
             return FetchOutcome(
                 node_id=node_id,
                 primary_ip=primary_ip,
@@ -74,12 +86,14 @@ def _elapsed_ms(started_at: float) -> int:
 
 
 def _result_kind_for_exception(exc: Exception) -> str:
-    if isinstance(exc, TimeoutError):
+    if isinstance(exc, (TimeoutError, SocketTimeout)):
         return "timeout"
     if isinstance(exc, JSONDecodeError):
         return "invalid_json"
     if isinstance(exc, ValueError):
         return "parse_error"
+    if isinstance(exc, ConnectionResetError):
+        return "connection_reset"
     if isinstance(exc, URLError):
         reason = str(exc.reason).lower() if getattr(exc, "reason", None) is not None else str(exc).lower()
         if "timed out" in reason:
@@ -88,5 +102,16 @@ def _result_kind_for_exception(exc: Exception) -> str:
             return "connection_refused"
         if "no route to host" in reason:
             return "no_route"
+        return "network_error"
+    if isinstance(exc, OSError):
+        error = str(exc).lower()
+        if "timed out" in error:
+            return "timeout"
+        if "refused" in error:
+            return "connection_refused"
+        if "no route to host" in error:
+            return "no_route"
+        if "reset by peer" in error:
+            return "connection_reset"
         return "network_error"
     return "error"

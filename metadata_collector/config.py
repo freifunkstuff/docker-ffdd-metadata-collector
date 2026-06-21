@@ -78,12 +78,17 @@ class MetadataCollectorConfig:
     node_status_dir: Path
     node_metadata_path: Path
     status_path: Path
+    meshviewer_path: Path
     published_node_metadata_path: Path
     published_status_path: Path
+    published_meshviewer_path: Path
     request_user_agent: str
     log_level: str
     log_summary_interval_seconds: float
     online_window_seconds: float
+    meshviewer_online_window_seconds: float
+    meshviewer_hide_temp_after_seconds: float
+    meshviewer_hide_stale_after_days: float
 
     @classmethod
     def from_env(cls) -> "MetadataCollectorConfig":
@@ -104,11 +109,17 @@ class MetadataCollectorConfig:
         status_path = Path(
             _get_config_value(defaults, "METADATA_COLLECTOR_STATUS_PATH", str(run_dir / "node-metadata-status.json"))
         ).resolve()
+        meshviewer_path = Path(
+            _get_config_value(defaults, "METADATA_COLLECTOR_MESHVIEWER_PATH", str(run_dir / "meshviewer" / "meshviewer.json"))
+        ).resolve()
         published_node_metadata_path = Path(
             _get_config_value(defaults, "METADATA_COLLECTOR_PUBLISHED_NODE_METADATA_PATH", str(webroot_dir / "node-metadata.json"))
         )
         published_status_path = Path(
             _get_config_value(defaults, "METADATA_COLLECTOR_PUBLISHED_STATUS_PATH", str(webroot_dir / "node-metadata-status.json"))
+        )
+        published_meshviewer_path = Path(
+            _get_config_value(defaults, "METADATA_COLLECTOR_PUBLISHED_MESHVIEWER_PATH", str(webroot_dir / "meshviewer" / "meshviewer.json"))
         )
         return cls(
             source_type=_get_config_value(defaults, "METADATA_COLLECTOR_SOURCE", "file-json"),
@@ -138,12 +149,17 @@ class MetadataCollectorConfig:
             node_status_dir=Path(_get_config_value(defaults, "METADATA_COLLECTOR_STATUS_DIR", str(state_dir / "status"))).resolve(),
             node_metadata_path=node_metadata_path,
             status_path=status_path,
+            meshviewer_path=meshviewer_path,
             published_node_metadata_path=published_node_metadata_path,
             published_status_path=published_status_path,
+            published_meshviewer_path=published_meshviewer_path,
             request_user_agent=_get_config_value(defaults, "METADATA_COLLECTOR_USER_AGENT", "metadata-collector/0.1"),
             log_level=_get_config_value(defaults, "METADATA_COLLECTOR_LOG_LEVEL", "INFO"),
             log_summary_interval_seconds=_get_config_float(defaults, "METADATA_COLLECTOR_LOG_SUMMARY_INTERVAL", 60.0),
             online_window_seconds=_get_config_float(defaults, "METADATA_COLLECTOR_ONLINE_WINDOW_SECONDS", 600.0),
+            meshviewer_online_window_seconds=_get_config_float(defaults, "METADATA_COLLECTOR_MESHVIEWER_ONLINE_WINDOW_SECONDS", 600.0),
+            meshviewer_hide_temp_after_seconds=_get_config_float(defaults, "METADATA_COLLECTOR_MESHVIEWER_HIDE_TEMP_AFTER_SECONDS", 1800.0),
+            meshviewer_hide_stale_after_days=_get_config_float(defaults, "METADATA_COLLECTOR_MESHVIEWER_HIDE_STALE_AFTER_DAYS", 30.0),
         )
 
     def ensure_directories(self) -> None:
@@ -156,5 +172,7 @@ class MetadataCollectorConfig:
         self.node_status_dir.mkdir(parents=True, exist_ok=True)
         self.node_metadata_path.parent.mkdir(parents=True, exist_ok=True)
         self.status_path.parent.mkdir(parents=True, exist_ok=True)
+        self.meshviewer_path.parent.mkdir(parents=True, exist_ok=True)
         self.published_node_metadata_path.parent.mkdir(parents=True, exist_ok=True)
         self.published_status_path.parent.mkdir(parents=True, exist_ok=True)
+        self.published_meshviewer_path.parent.mkdir(parents=True, exist_ok=True)

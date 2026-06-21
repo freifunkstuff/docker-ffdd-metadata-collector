@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from metadata_collector.config import MetadataCollectorConfig  # noqa: E402
 from metadata_collector.app import MetadataCollectorApp  # noqa: E402
+from metadata_collector.fetcher import SysinfoFetcher  # noqa: E402
+from metadata_collector.meshviewer import build_community_meshviewer_documents, build_meshviewer_document  # noqa: E402
 from metadata_collector.models import DiscoveredNode, FetchOutcome, NodeState, ParseResult  # noqa: E402
 from metadata_collector.node_list_sources import FileJsonNodeListSource, parse_node_list_payload  # noqa: E402
 from metadata_collector.scheduler import classify_poll_mode, compute_next_poll_at, fetch_timeout_for_mode  # noqa: E402
@@ -35,6 +37,24 @@ class FakeScheduler:
 
     def schedule(self, node_id: str, due_at: object) -> None:
         self.calls.append((node_id, due_at))
+
+
+class WakeableScheduler:
+    def __init__(self) -> None:
+        self.ready_node_id: str | None = None
+
+    def schedule(self, node_id: str, due_at: object) -> None:
+        self.ready_node_id = node_id
+
+    def pop_due(self, now: object, limit: int) -> list[str]:
+        if self.ready_node_id is None:
+            return []
+        node_id = self.ready_node_id
+        self.ready_node_id = None
+        return [node_id]
+
+    def seconds_until_next_due(self, now: object) -> float:
+        return 3600.0
 
 
 class FakeStore:
@@ -91,7 +111,7 @@ class ScaffoldTests(unittest.TestCase):
         self.assertEqual(["1001", "1002"], [node.node_id for node in nodes])
         self.assertEqual("10.0.0.2", nodes[-1].primary_ip)
 
-    def test_parse_node_list_payload_ignores_local_node_and_gateways(self) -> None:
+    def test_parse_node_list_payload_includes_local_node_but_ignores_gateways(self) -> None:
         payload = {
             "timestamp": "1774740830",
             "node": {"id": "51082", "ip": "10.200.200.83"},
@@ -110,7 +130,7 @@ class ScaffoldTests(unittest.TestCase):
 
         nodes = parse_node_list_payload(payload)
 
-        self.assertEqual(["51010", "51015"], [node.node_id for node in nodes])
+        self.assertEqual(["51010", "51015", "51082"], [node.node_id for node in nodes])
 
     def test_state_store_roundtrip_and_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -199,6 +219,8 @@ class ScaffoldTests(unittest.TestCase):
             self.assertEqual("file-json", status["collector"]["sourceType"])
             self.assertEqual(1, status["fetch"]["fetches"])
             self.assertEqual(0.067, status["fetch"]["ratePerMinute"])
+            self.assertEqual("2025-01-01T00:01:00+00:00", status["fetch"]["lastFetchAt"])
+            self.assertEqual("2025-01-01T00:01:00+00:00", status["fetch"]["lastSuccessfulFetchAt"])
 
     def test_fetch_failure_updates_stats_without_dropping_previous_info(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -253,6 +275,50 @@ class ScaffoldTests(unittest.TestCase):
             self.assertEqual("TimeoutError: timed out", state.fetch_error)
             self.assertEqual(2, len(state.request_history))
             self.assertEqual("timeout", state.request_history[-1]["result"])
+
+    def test_build_status_document_tracks_last_fetch_and_last_success_separately(self) -> None:
+        status = build_status_document(
+            generated_at="2025-01-01T00:10:00+00:00",
+            states=[
+                NodeState(
+                    node_id="1001",
+                    primary_ip="10.0.0.1",
+                    first_seen_at="2025-01-01T00:00:00+00:00",
+                    last_source_seen_at="2025-01-01T00:09:30+00:00",
+                    last_fetch_at="2025-01-01T00:08:00+00:00",
+                    last_success_at="2025-01-01T00:07:00+00:00",
+                ),
+                NodeState(
+                    node_id="1002",
+                    primary_ip="10.0.0.2",
+                    first_seen_at="2025-01-01T00:00:00+00:00",
+                    last_source_seen_at="2025-01-01T00:09:00+00:00",
+                    last_fetch_at="2025-01-01T00:09:30+00:00",
+                    last_success_at="2025-01-01T00:06:30+00:00",
+                    fetch_error="TimeoutError: timed out",
+                ),
+            ],
+            online_window_seconds=600.0,
+            fetch_window_seconds=900.0,
+            source_type="file-json",
+            source="/run/freifunk/sysinfo/nodes.json",
+        )
+
+        self.assertEqual("2025-01-01T00:09:30+00:00", status["fetch"]["lastFetchAt"])
+        self.assertEqual("2025-01-01T00:07:00+00:00", status["fetch"]["lastSuccessfulFetchAt"])
+
+    def test_fetcher_returns_failure_for_connection_reset(self) -> None:
+        fetcher = SysinfoFetcher()
+
+        from unittest.mock import patch
+
+        with patch("metadata_collector.fetcher.urlopen", side_effect=ConnectionResetError(104, "Connection reset by peer")):
+            outcome = fetcher._fetch_sync("1001", "10.0.0.1", 10.0)
+
+        self.assertFalse(outcome.success)
+        self.assertEqual("connection_reset", outcome.result_kind)
+        self.assertIn("ConnectionResetError", outcome.error)
+        self.assertEqual(10000, outcome.timeout_ms)
 
     def test_reloading_prefers_discovery_last_source_seen_over_stale_info_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -487,6 +553,84 @@ class ScaffoldTests(unittest.TestCase):
 
         self.assertEqual([], app.scheduler.calls)
 
+    def test_poll_node_reschedules_after_unexpected_fetch_exception(self) -> None:
+        config = MetadataCollectorConfig.from_env()
+        app = MetadataCollectorApp(config)
+        existing = NodeState(
+            node_id="1001",
+            primary_ip="10.0.0.1",
+            first_seen_at="2025-01-01T00:00:00+00:00",
+            last_source_seen_at="2025-01-01T00:05:00+00:00",
+        )
+        app.store = FakeStore([existing])
+        app.scheduler = FakeScheduler()
+
+        class RaisingFetcher:
+            async def fetch(self, node_id: str, primary_ip: str, timeout_seconds: float) -> FetchOutcome:
+                raise RuntimeError("boom")
+
+        app.fetcher = RaisingFetcher()  # type: ignore[assignment]
+
+        import asyncio
+
+        asyncio.run(app._poll_node("1001", asyncio.Semaphore(1)))
+
+        self.assertEqual(1, len(app.scheduler.calls))
+        self.assertEqual("1001", app.scheduler.calls[0][0])
+
+    def test_poll_loop_wakes_when_discovery_schedules_new_node(self) -> None:
+        import asyncio
+
+        config = MetadataCollectorConfig.from_env()
+        app = MetadataCollectorApp(config)
+        existing = NodeState(
+            node_id="2002",
+            primary_ip="10.0.0.2",
+            first_seen_at="2025-01-01T00:00:00+00:00",
+            last_source_seen_at="2025-01-01T00:05:00+00:00",
+        )
+        app.store = FakeStore([existing])
+        app.scheduler = WakeableScheduler()  # type: ignore[assignment]
+
+        class RecordingFetcher:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, float]] = []
+                self.called = asyncio.Event()
+
+            async def fetch(self, node_id: str, primary_ip: str, timeout_seconds: float) -> FetchOutcome:
+                self.calls.append((node_id, primary_ip, timeout_seconds))
+                self.called.set()
+                return FetchOutcome(
+                    node_id=node_id,
+                    primary_ip=primary_ip,
+                    fetched_at="2025-01-01T00:06:00+00:00",
+                    success=True,
+                    parse_result=ParseResult(
+                        node_id=node_id,
+                        version="1",
+                        timestamp="2025-01-01T00:06:00+00:00",
+                        node_type="server",
+                        parser_name="test",
+                        info={"community": "Leipzig", "node_type": "server"},
+                    ),
+                )
+
+        fetcher = RecordingFetcher()
+        app.fetcher = fetcher  # type: ignore[assignment]
+
+        async def run_test() -> None:
+            task = asyncio.create_task(app._poll_loop())
+            await asyncio.sleep(0)
+            app._schedule_node("2002", datetime.now(timezone.utc))
+            await asyncio.wait_for(fetcher.called.wait(), timeout=1.0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(run_test())
+
+        self.assertEqual([("2002", "10.0.0.2", config.fetch_timeout_normal_seconds)], fetcher.calls)
+
     def test_summarize_states_reports_online_and_stale_breakdown(self) -> None:
         config = MetadataCollectorConfig.from_env()
         app = MetadataCollectorApp(config)
@@ -555,6 +699,200 @@ class ScaffoldTests(unittest.TestCase):
         self.assertEqual(3, summary["fetches"])
         self.assertEqual(1.5, summary["ratePerMinute"])
         self.assertEqual(120.0, summary["windowSeconds"])
+
+    def test_build_meshviewer_document_applies_old_visibility_and_format_rules(self) -> None:
+        document = build_meshviewer_document(
+            generated_at="2025-01-01T00:10:00+00:00",
+            states=[
+                NodeState(
+                    node_id="1001",
+                    primary_ip="10.0.0.1",
+                    first_seen_at="2025-01-01T00:00:00+00:00",
+                    last_source_seen_at="2025-01-01T00:09:00+00:00",
+                    last_success_at="2025-01-01T00:09:30+00:00",
+                    info={
+                        "name": "Glas+%26+Bohne",
+                        "community": "Leipzig",
+                        "group": "A",
+                        "contact_email": "a@example.invalid",
+                        "model": "X1",
+                        "cpu_count": 2,
+                        "location_latitude": 51.34,
+                        "location_longitude": 12.37,
+                        "location_altitude": 120,
+                        "firmware_base": "OpenWrt",
+                        "firmware_release": "1.2.3",
+                        "auto_update": True,
+                        "node_type": "node",
+                    },
+                    stats={
+                        "clients_2g": 3,
+                        "clients_5g": 4,
+                        "uptime_seconds": 120.0,
+                        "load_avg_5": 0.42,
+                        "mem_total": 100,
+                        "mem_free": 25,
+                        "selected_gateway": "gw-a",
+                        "preferred_gateway": "gw-b",
+                    },
+                    links=[
+                        {
+                            "type": "wifi_mesh",
+                            "left_node_id": "1001",
+                            "right_node_id": "1002",
+                            "left_tq": 80,
+                            "left_rq": 70,
+                            "left_ts": "1735690180",
+                        }
+                    ],
+                ),
+                NodeState(
+                    node_id="1002",
+                    primary_ip="10.0.0.2",
+                    first_seen_at="2025-01-01T00:00:00+00:00",
+                    last_source_seen_at="2024-12-31T23:59:30+00:00",
+                    info={
+                        "name": "Beta",
+                        "community": "Leipzig",
+                        "node_type": "server",
+                        "location_latitude": 51.0,
+                        "location_longitude": 12.0,
+                    },
+                    stats={},
+                    links=[
+                        {
+                            "type": "wifi_mesh",
+                            "left_node_id": "1001",
+                            "right_node_id": "1002",
+                            "right_tq": 90,
+                            "right_rq": 95,
+                            "right_ts": "1735690190",
+                        }
+                    ],
+                ),
+                NodeState(
+                    node_id="901",
+                    primary_ip="10.0.0.9",
+                    first_seen_at="2025-01-01T00:00:00+00:00",
+                    last_source_seen_at="2024-12-31T23:38:00+00:00",
+                    info={"community": "Leipzig", "node_type": "node"},
+                ),
+                NodeState(
+                    node_id="3001",
+                    primary_ip="10.0.0.30",
+                    first_seen_at="2024-10-01T00:00:00+00:00",
+                    last_source_seen_at="2024-11-01T00:00:00+00:00",
+                    info={"community": "Leipzig", "node_type": "node"},
+                ),
+            ],
+            online_window_seconds=600.0,
+            hide_temp_after_seconds=1800.0,
+            hide_stale_after_days=30.0,
+        )
+
+        self.assertEqual("2025-01-01T00:10:00+00:00", document["timestamp"])
+        self.assertEqual(["1001", "1002"], [item["node_id"] for item in document["nodes"]])
+        self.assertEqual(1, len(document["links"]))
+
+        alpha = document["nodes"][0]
+        self.assertEqual("Glas & Bohne (1001)", alpha["hostname"])
+        self.assertEqual(["10.0.0.1"], alpha["addresses"])
+        self.assertEqual("ff:dd:00:00:03:e9", alpha["mac"])
+        self.assertTrue(alpha["is_online"])
+        self.assertFalse(alpha["is_gateway"])
+        self.assertEqual(7, alpha["clients"])
+        self.assertEqual(3, alpha["clients_wifi24"])
+        self.assertEqual(4, alpha["clients_wifi5"])
+        self.assertEqual("gw-a (gw-b)", alpha["gateway"])
+        self.assertEqual("2025-01-01T00:08:00+00:00", alpha["uptime"])
+        self.assertEqual(0.75, alpha["memory_usage"])
+        self.assertEqual({"base": "OpenWrt", "release": "1.2.3"}, alpha["firmware"])
+        self.assertEqual({"enabled": True, "branch": "stable"}, alpha["autoupdater"])
+        self.assertEqual({"latitude": 51.34, "longitude": 12.37, "altitude": 120}, alpha["location"])
+
+        beta = document["nodes"][1]
+        self.assertFalse(beta["is_online"])
+        self.assertTrue(beta["is_gateway"])
+        self.assertNotIn("location", beta)
+
+        link = document["links"][0]
+        self.assertEqual("1001", link["source"])
+        self.assertEqual("1002", link["target"])
+        self.assertEqual("wifi", link["type"])
+        self.assertEqual(0.8, link["source_tq"])
+        self.assertEqual(0.9, link["target_tq"])
+
+    def test_build_community_meshviewer_documents_include_servers_for_each_community(self) -> None:
+        documents = build_community_meshviewer_documents(
+            generated_at="2025-01-01T00:10:00+00:00",
+            states=[
+                NodeState(
+                    node_id="1001",
+                    primary_ip="10.0.0.1",
+                    first_seen_at="2025-01-01T00:00:00+00:00",
+                    last_source_seen_at="2025-01-01T00:09:00+00:00",
+                    info={"community": "Leipzig", "name": "Alpha", "node_type": "node"},
+                    links=[
+                        {
+                            "type": "wifi_mesh",
+                            "left_node_id": "1001",
+                            "right_node_id": "1002",
+                            "left_tq": 80,
+                            "left_ts": "1735690180",
+                        }
+                    ],
+                ),
+                NodeState(
+                    node_id="1002",
+                    primary_ip="10.0.0.2",
+                    first_seen_at="2025-01-01T00:00:00+00:00",
+                    last_source_seen_at="2025-01-01T00:09:30+00:00",
+                    info={"community": "Leipzig", "name": "Beta", "node_type": "node"},
+                    links=[
+                        {
+                            "type": "wifi_mesh",
+                            "left_node_id": "1001",
+                            "right_node_id": "1002",
+                            "right_tq": 90,
+                            "right_ts": "1735690190",
+                        }
+                    ],
+                ),
+                NodeState(
+                    node_id="1500",
+                    primary_ip="10.0.0.15",
+                    first_seen_at="2025-01-01T00:00:00+00:00",
+                    last_source_seen_at="2025-01-01T00:09:30+00:00",
+                    info={"community": "Backbone", "name": "Server", "node_type": "server"},
+                    links=[
+                        {
+                            "type": "wifi_mesh",
+                            "left_node_id": "1001",
+                            "right_node_id": "1500",
+                            "right_tq": 95,
+                            "right_ts": "1735690195",
+                        }
+                    ],
+                ),
+                NodeState(
+                    node_id="2001",
+                    primary_ip="10.0.1.1",
+                    first_seen_at="2025-01-01T00:00:00+00:00",
+                    last_source_seen_at="2025-01-01T00:09:00+00:00",
+                    info={"community": "Dresden Süd", "name": "Gamma", "node_type": "node"},
+                ),
+            ],
+            online_window_seconds=600.0,
+            hide_temp_after_seconds=1800.0,
+            hide_stale_after_days=30.0,
+        )
+
+        self.assertEqual(["backbone", "dresden-sud", "leipzig"], sorted(documents))
+        self.assertEqual(["1001", "1002", "1500"], [item["node_id"] for item in documents["leipzig"]["nodes"]])
+        self.assertEqual(2, len(documents["leipzig"]["links"]))
+        self.assertEqual(["1500", "2001"], [item["node_id"] for item in documents["dresden-sud"]["nodes"]])
+        self.assertEqual([], documents["dresden-sud"]["links"])
+        self.assertEqual(["1500"], [item["node_id"] for item in documents["backbone"]["nodes"]])
 
     def test_run_writes_persistence_outputs_before_initial_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -626,13 +964,18 @@ class ScaffoldTests(unittest.TestCase):
         self.assertEqual(config.state_dir / "status", config.node_status_dir)
         self.assertEqual(config.run_dir / "node-metadata.json", config.node_metadata_path)
         self.assertEqual(config.run_dir / "node-metadata-status.json", config.status_path)
+        self.assertEqual(config.run_dir / "meshviewer" / "meshviewer.json", config.meshviewer_path)
         self.assertEqual(config.webroot_dir / "node-metadata.json", config.published_node_metadata_path)
         self.assertEqual(config.webroot_dir / "node-metadata-status.json", config.published_status_path)
+        self.assertEqual(config.webroot_dir / "meshviewer" / "meshviewer.json", config.published_meshviewer_path)
         self.assertEqual(10.0, config.fetch_timeout_normal_seconds)
         self.assertEqual(30.0, config.fetch_timeout_slow_seconds)
         self.assertEqual(60.0, config.fetch_timeout_very_slow_seconds)
         self.assertEqual(90.0 * 24.0 * 3600.0, config.node_retention_seconds)
         self.assertEqual(600.0, config.online_window_seconds)
+        self.assertEqual(600.0, config.meshviewer_online_window_seconds)
+        self.assertEqual(1800.0, config.meshviewer_hide_temp_after_seconds)
+        self.assertEqual(30.0, config.meshviewer_hide_stale_after_days)
 
     def test_defaults_file_is_used_and_env_overrides_it(self) -> None:
         old = dict(os.environ)
@@ -698,31 +1041,55 @@ class ScaffoldTests(unittest.TestCase):
                     NodeState(
                         node_id="1001",
                         primary_ip="10.0.0.1",
-                        first_seen_at="2025-01-01T00:00:00+00:00",
-                        last_source_seen_at="2025-01-01T00:05:00+00:00",
-                        last_success_at="2025-01-01T00:05:30+00:00",
+                        first_seen_at="2026-03-30T00:00:00+00:00",
+                        last_source_seen_at="2026-03-30T00:05:00+00:00",
+                        last_success_at="2026-03-30T00:05:30+00:00",
                         info={"community": "Dresden"},
-                    )
+                    ),
+                    NodeState(
+                        node_id="1002",
+                        primary_ip="10.0.0.2",
+                        first_seen_at="2026-03-30T00:00:00+00:00",
+                        last_source_seen_at="2026-03-30T00:05:00+00:00",
+                        last_success_at="2026-03-30T00:05:30+00:00",
+                        info={"community": "Leipzig"},
+                    ),
                 ]
             )
 
             import asyncio
+            from unittest.mock import patch
 
-            asyncio.run(app._write_outputs(reason="test"))
+            with patch("metadata_collector.app._utcnow", return_value=datetime(2026, 3, 30, 0, 10, 0, tzinfo=timezone.utc)):
+                asyncio.run(app._write_outputs(reason="test"))
 
             self.assertTrue(config.node_metadata_path.exists())
             self.assertTrue(config.status_path.exists())
+            self.assertTrue(config.meshviewer_path.exists())
             self.assertTrue(config.published_node_metadata_path.is_symlink())
             self.assertTrue(config.published_status_path.is_symlink())
+            self.assertTrue(config.published_meshviewer_path.is_symlink())
+            leipzig_runtime_path = config.meshviewer_path.parent / "leipzig" / config.meshviewer_path.name
+            leipzig_published_path = config.published_meshviewer_path.parent / "leipzig" / config.published_meshviewer_path.name
+            self.assertTrue(leipzig_runtime_path.exists())
+            self.assertTrue(leipzig_published_path.is_symlink())
             self.assertEqual(config.node_metadata_path, config.published_node_metadata_path.resolve())
             self.assertEqual(config.status_path, config.published_status_path.resolve())
+            self.assertEqual(config.meshviewer_path, config.published_meshviewer_path.resolve())
+            self.assertEqual(leipzig_runtime_path, leipzig_published_path.resolve())
 
             node_metadata = json.loads(config.node_metadata_path.read_text(encoding="utf-8"))
             status = json.loads(config.status_path.read_text(encoding="utf-8"))
-            self.assertEqual(1, len(node_metadata["nodes"]))
-            self.assertEqual(1, status["nodes"]["total"])
+            meshviewer = json.loads(config.meshviewer_path.read_text(encoding="utf-8"))
+            leipzig_meshviewer = json.loads(leipzig_runtime_path.read_text(encoding="utf-8"))
+            self.assertEqual(2, len(node_metadata["nodes"]))
+            self.assertEqual(2, status["nodes"]["total"])
+            self.assertEqual(2, len(meshviewer["nodes"]))
+            self.assertEqual(["1002"], [item["node_id"] for item in leipzig_meshviewer["nodes"]])
             self.assertEqual("file-json", status["collector"]["sourceType"])
             self.assertEqual(str(config.source_path), status["collector"]["source"])
+            self.assertEqual("2026-03-30T00:05:30+00:00", status["fetch"]["lastFetchAt"])
+            self.assertEqual("2026-03-30T00:05:30+00:00", status["fetch"]["lastSuccessfulFetchAt"])
 
     def test_config_does_not_resolve_existing_published_symlink_targets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

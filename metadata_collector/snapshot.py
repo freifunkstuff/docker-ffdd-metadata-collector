@@ -33,6 +33,8 @@ def build_status_document(
     unknown = 0
     nodes_with_info = 0
     nodes_with_fetch_error = 0
+    last_fetch_at: str | None = None
+    last_successful_fetch_at: str | None = None
     for state in states:
         is_online = state.is_online(generated_at_dt, online_window_seconds)
         if is_online is True:
@@ -45,8 +47,12 @@ def build_status_document(
             nodes_with_info += 1
         if state.fetch_error:
             nodes_with_fetch_error += 1
+        last_fetch_at = _max_timestamp(last_fetch_at, state.last_fetch_at or state.last_success_at)
+        last_successful_fetch_at = _max_timestamp(last_successful_fetch_at, state.last_success_at)
 
     fetch_summary = build_fetch_summary(generated_at_dt, states, fetch_window_seconds)
+    fetch_summary["lastFetchAt"] = last_fetch_at
+    fetch_summary["lastSuccessfulFetchAt"] = last_successful_fetch_at
 
     return {
         "generatedAt": generated_at,
@@ -142,3 +148,13 @@ def _parse_optional_timestamp(value: Any) -> datetime | None:
         return _parse_iso_timestamp(str(value))
     except ValueError:
         return None
+
+
+def _max_timestamp(left: str | None, right: str | None) -> str | None:
+    left_dt = _parse_optional_timestamp(left)
+    right_dt = _parse_optional_timestamp(right)
+    if left_dt is None:
+        return right
+    if right_dt is None:
+        return left
+    return left if left_dt >= right_dt else right

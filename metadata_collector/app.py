@@ -4,10 +4,11 @@ import asyncio
 import contextlib
 import logging
 import signal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .config import MetadataCollectorConfig
 from .fetcher import SysinfoFetcher
+from .meshviewer import build_community_meshviewer_documents, build_meshviewer_document
 from .models import NodeState
 from .node_list_sources import BmxdNodeListSource, FileJsonNodeListSource, HttpJsonNodeListSource, NodeListSource, NodeListSourceError
 from .scheduler import PollScheduler, classify_poll_mode, compute_next_poll_at, fetch_timeout_for_mode
@@ -25,6 +26,7 @@ class MetadataCollectorApp:
         self.fetcher = SysinfoFetcher(user_agent=config.request_user_agent)
         self.store = self._create_store()
         self.scheduler = PollScheduler()
+        self._scheduler_wakeup = asyncio.Event()
         self._stop_event = asyncio.Event()
 
     async def run(self) -> None:
@@ -120,6 +122,10 @@ class MetadataCollectorApp:
             scheduled_count += 1
         return scheduled_count
 
+    def _schedule_node(self, node_id: str, due_at: datetime) -> None:
+        self.scheduler.schedule(node_id, due_at)
+        self._scheduler_wakeup.set()
+
     async def _run_discovery_once(self, initial: bool = False) -> None:
         discovered_at = _utcnow().isoformat()
         try:
@@ -133,7 +139,7 @@ class MetadataCollectorApp:
         new_node_count = 0
         for node in nodes:
             if node.node_id not in known_node_ids:
-                self.scheduler.schedule(node.node_id, _utcnow())
+                self._schedule_node(node.node_id, _utcnow())
                 new_node_count += 1
         if initial or new_node_count > 0:
             logger.info(
@@ -161,7 +167,13 @@ class MetadataCollectorApp:
             now = _utcnow()
             due_node_ids = self.scheduler.pop_due(now, self.config.fetch_concurrency)
             if not due_node_ids:
-                await asyncio.sleep(self.scheduler.seconds_until_next_due(now))
+                timeout = self.scheduler.seconds_until_next_due(now)
+                try:
+                    await asyncio.wait_for(self._scheduler_wakeup.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    pass
+                finally:
+                    self._scheduler_wakeup.clear()
                 continue
             await asyncio.gather(*(self._poll_node(node_id, semaphore) for node_id in due_node_ids))
 
@@ -169,16 +181,21 @@ class MetadataCollectorApp:
         state = self.store.get_node_state(node_id)
         if state is None:
             return
-        poll_mode = classify_poll_mode(self.config, state, _utcnow())
-        timeout_seconds = fetch_timeout_for_mode(self.config, poll_mode)
-        async with semaphore:
-            outcome = await self.fetcher.fetch(node_id=node_id, primary_ip=state.primary_ip, timeout_seconds=timeout_seconds)
-        now = _utcnow()
-        self.store.apply_fetch_outcome(outcome)
-        refreshed_state = self.store.get_node_state(node_id) or state
-        next_poll_at = compute_next_poll_at(self.config, refreshed_state, outcome, now)
-        refreshed_state.next_poll_at = next_poll_at.isoformat()
-        self.scheduler.schedule(node_id, next_poll_at)
+        try:
+            poll_mode = classify_poll_mode(self.config, state, _utcnow())
+            timeout_seconds = fetch_timeout_for_mode(self.config, poll_mode)
+            async with semaphore:
+                outcome = await self.fetcher.fetch(node_id=node_id, primary_ip=state.primary_ip, timeout_seconds=timeout_seconds)
+            now = _utcnow()
+            self.store.apply_fetch_outcome(outcome)
+            refreshed_state = self.store.get_node_state(node_id) or state
+            next_poll_at = compute_next_poll_at(self.config, refreshed_state, outcome, now)
+            refreshed_state.next_poll_at = next_poll_at.isoformat()
+            self._schedule_node(node_id, next_poll_at)
+        except Exception:
+            retry_at = _utcnow() + timedelta(seconds=self.config.poll_interval_slow_seconds)
+            logger.exception("poll failed node_id=%s primary_ip=%s retry_at=%s", node_id, state.primary_ip, retry_at.isoformat())
+            self._schedule_node(node_id, retry_at)
 
     async def _snapshot_loop(self) -> None:
         while True:
@@ -202,7 +219,21 @@ class MetadataCollectorApp:
             source_type=self.config.source_type,
             source=self._source_label(),
         )
-        await asyncio.gather(
+        meshviewer_document = build_meshviewer_document(
+            generated_at=generated_at,
+            states=states,
+            online_window_seconds=self.config.meshviewer_online_window_seconds,
+            hide_temp_after_seconds=self.config.meshviewer_hide_temp_after_seconds,
+            hide_stale_after_days=self.config.meshviewer_hide_stale_after_days,
+        )
+        community_meshviewer_documents = build_community_meshviewer_documents(
+            generated_at=generated_at,
+            states=states,
+            online_window_seconds=self.config.meshviewer_online_window_seconds,
+            hide_temp_after_seconds=self.config.meshviewer_hide_temp_after_seconds,
+            hide_stale_after_days=self.config.meshviewer_hide_stale_after_days,
+        )
+        publish_tasks = [
             asyncio.to_thread(
                 write_published_json_atomic,
                 self.config.node_metadata_path,
@@ -215,21 +246,41 @@ class MetadataCollectorApp:
                 self.config.published_status_path,
                 status_document,
             ),
-        )
+            asyncio.to_thread(
+                write_published_json_atomic,
+                self.config.meshviewer_path,
+                self.config.published_meshviewer_path,
+                meshviewer_document,
+            ),
+        ]
+        for community_slug, community_document in community_meshviewer_documents.items():
+            publish_tasks.append(
+                asyncio.to_thread(
+                    write_published_json_atomic,
+                    self.config.meshviewer_path.parent / community_slug / self.config.meshviewer_path.name,
+                    self.config.published_meshviewer_path.parent / community_slug / self.config.published_meshviewer_path.name,
+                    community_document,
+                )
+            )
+        await asyncio.gather(*publish_tasks)
         if reason is not None:
             logger.info(
-                "outputs written reason=%s nodes=%s node_metadata_path=%s status_path=%s",
+                "outputs written reason=%s nodes=%s node_metadata_path=%s status_path=%s meshviewer_path=%s meshviewer_communities=%s",
                 reason,
                 len(node_metadata_document["nodes"]),
                 self.config.node_metadata_path,
                 self.config.status_path,
+                self.config.meshviewer_path,
+                len(community_meshviewer_documents),
             )
         else:
             logger.debug(
-                "outputs written nodes=%s node_metadata_path=%s status_path=%s",
+                "outputs written nodes=%s node_metadata_path=%s status_path=%s meshviewer_path=%s meshviewer_communities=%s",
                 len(node_metadata_document["nodes"]),
                 self.config.node_metadata_path,
                 self.config.status_path,
+                self.config.meshviewer_path,
+                len(community_meshviewer_documents),
             )
 
     def _log_summary(self) -> None:

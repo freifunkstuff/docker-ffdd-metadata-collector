@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Any, Iterable
+from urllib.parse import unquote_plus
 
 from .models import ParseResult
 
@@ -34,6 +35,13 @@ def _coerce_str(value: Any) -> str | None:
     if isinstance(value, str):
         return value
     return str(value)
+
+
+def _decode_urlencoded_text(value: Any) -> str | None:
+    text = _coerce_str(value)
+    if text in (None, ""):
+        return text
+    return unquote_plus(text)
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -277,10 +285,10 @@ class GenericSysinfoParser:
         _set_if(info, "model", model)
 
         for key, value, source in [
-            ("name", contact.get("name"), "data.contact.name"),
-            ("location", contact.get("location"), "data.contact.location"),
-            ("contact_email", contact.get("email"), "data.contact.email"),
-            ("note", contact.get("note"), "data.contact.note"),
+            ("name", _decode_urlencoded_text(contact.get("name")), "data.contact.name"),
+            ("location", _decode_urlencoded_text(contact.get("location")), "data.contact.location"),
+            ("contact_email", _decode_urlencoded_text(contact.get("email")), "data.contact.email"),
+            ("note", _decode_urlencoded_text(contact.get("note")), "data.contact.note"),
             ("node_type", node_type, "data.system.node_type"),
             ("group", common.get("group_id"), "data.common.group_id"),
             ("city", common.get("city"), "data.common.city"),

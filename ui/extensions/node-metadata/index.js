@@ -59,7 +59,9 @@ function renderTableRows(status) {
   const fetch = status?.fetch || {};
   const nodes = status?.nodes || {};
   const rows = [
-    ["Stand", formatTimestamp(status?.generatedAt)],
+    ["Status berechnet", formatTimestamp(status?.generatedAt)],
+    ["Letzter Fetch", formatTimestamp(fetch.lastFetchAt)],
+    ["Letzter erfolgreicher Fetch", formatTimestamp(fetch.lastSuccessfulFetchAt)],
     ["Quelle", numberOrDash(collector.source)],
     ["Source-Type", numberOrDash(collector.sourceType)],
     ["Online-Fenster", numberOrDash(collector.onlineWindowSeconds)],

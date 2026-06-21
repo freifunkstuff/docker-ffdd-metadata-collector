@@ -95,6 +95,9 @@ def parse_node_list_payload(payload: Any) -> list[DiscoveredNode]:
     if isinstance(payload, list):
         _extract_from_iterable(payload, add_node, "list")
     elif isinstance(payload, dict):
+        if isinstance(payload.get("node"), dict):
+            _extract_from_iterable([payload["node"]], add_node, "node")
+
         if isinstance(payload.get("nodes"), list):
             _extract_from_iterable(payload["nodes"], add_node, "nodes[]")
         elif isinstance(payload.get("nodes"), dict):
