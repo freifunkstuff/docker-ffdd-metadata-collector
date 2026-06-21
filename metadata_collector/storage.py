@@ -102,6 +102,27 @@ class YamlBackedMemoryStore:
         state.fetch_error = outcome.error
         self._write_status_state(state)
 
+    def seed_states(self, seeds: list[NodeState], generated_at: str) -> int:
+        """Merge bootstrap seeds into the store and persist them.
+
+        Data already produced by real polls is preserved; missing fields are
+        filled from the seed and ``first_seen_at`` is only ever lowered. Safe to
+        re-run.
+        """
+        for seed in seeds:
+            existing = self._states.get(seed.node_id)
+            if existing is None:
+                self._states[seed.node_id] = seed
+            else:
+                _merge_seed_into(existing, seed)
+
+        for node_id in sorted(self._states, key=_sort_key):
+            state = self._states[node_id]
+            self._write_info_state(state)
+            self._write_status_state(state)
+        self._write_discovery_state(generated_at=generated_at)
+        return len(seeds)
+
     def purge_nodes_older_than(self, now: datetime, retention_seconds: float) -> int:
         cutoff = now - timedelta(seconds=retention_seconds)
         removable_node_ids = [
@@ -276,6 +297,46 @@ def _as_optional_bool(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+def _merge_seed_into(existing: NodeState, seed: NodeState) -> None:
+    existing.first_seen_at = _earlier_timestamp(existing.first_seen_at, seed.first_seen_at)
+    if not existing.primary_ip:
+        existing.primary_ip = seed.primary_ip
+    if not existing.last_source_seen_at:
+        existing.last_source_seen_at = seed.last_source_seen_at
+    if not existing.last_success_at:
+        existing.last_success_at = seed.last_success_at
+    if not existing.last_fetch_at:
+        existing.last_fetch_at = seed.last_fetch_at
+    if not existing.info:
+        existing.info = seed.info
+    if not existing.stats:
+        existing.stats = seed.stats
+    if existing.node_type is None:
+        existing.node_type = seed.node_type
+
+
+def _earlier_timestamp(left: str | None, right: str | None) -> str | None:
+    left_dt = _parse_state_timestamp(left)
+    right_dt = _parse_state_timestamp(right)
+    if left_dt is None:
+        return right or left
+    if right_dt is None:
+        return left or right
+    return left if left_dt <= right_dt else right
+
+
+def _parse_state_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def _sort_key(node_id: str) -> tuple[int, str]:
     if node_id.isdigit():
         return (0, f"{int(node_id):020d}")
