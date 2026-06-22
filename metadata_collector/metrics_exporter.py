@@ -93,6 +93,10 @@ class VictoriametricsExporter:
     def _community_ok(self, state: NodeState) -> bool:
         if not self.communities:
             return True
+        # Servers/gateways always pass so their gateway links stay visible,
+        # matching the old CommunityFilter behaviour.
+        if _is_server(state):
+            return True
         community = state.community
         return community is not None and community.lower() in self.communities
 
@@ -174,6 +178,10 @@ class VictoriametricsExporter:
         line = _metric_line("link_tq", label_str, tq, timestamp_ms=int(timestamp.timestamp() * 1000))
         if line is not None:
             lines.append(line)
+
+
+def _is_server(state: NodeState) -> bool:
+    return state.node_type == "server" or str(state.info.get("node_type") or "") == "server"
 
 
 def _autoupdater_label(value: Any) -> str | None:

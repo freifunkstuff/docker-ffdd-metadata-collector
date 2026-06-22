@@ -128,6 +128,14 @@ class NodeMetricsTest(unittest.TestCase):
         leipzig = VictoriametricsExporter(import_url="http://vm", communities=frozenset({"leipzig"}))
         self.assertIn("node_info", _lines(leipzig.build_payload([_node()], NOW)))
 
+    def test_servers_bypass_community_filter(self) -> None:
+        exporter = VictoriametricsExporter(import_url="http://vm", communities=frozenset({"dresden"}))
+        # a gateway in a non-whitelisted community is still pushed
+        server = _node()
+        server.info["community"] = "Leipzig"
+        server.info["node_type"] = "server"
+        self.assertIn("node_info", _lines(exporter.build_payload([server], NOW)))
+
     def test_label_value_escaping(self) -> None:
         node = _node()
         node.info["name"] = 'we"ird\nname'
