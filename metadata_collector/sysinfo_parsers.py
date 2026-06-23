@@ -213,6 +213,14 @@ def _normalize_port_list(ports: Iterable[Any]) -> list[dict[str, Any]]:
     return normalized
 
 
+def _first_present(*values: Any) -> Any:
+    """First value that is not None. Unlike ``a or b`` this keeps a legit 0."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def _set_if(target: dict[str, Any], key: str, value: Any) -> None:
     if value is not None:
         target[key] = value
@@ -326,8 +334,8 @@ class GenericSysinfoParser:
             ("mem_free", _parse_nbytes(statistic.get("meminfo_MemFree"))),
             ("clients_2g", _coerce_int(_get_path(statistic, "client2g", "1min"))),
             ("clients_5g", _coerce_int(_get_path(statistic, "client5g", "1min"))),
-            ("traffic_wifi_rx", _coerce_int(interfaces.get("wifi2_rx")) or _coerce_int(statistic.get("traffic_any_ap"))),
-            ("traffic_wifi_tx", _coerce_int(interfaces.get("wifi2_tx")) or _coerce_int(statistic.get("traffic_ap_any"))),
+            ("traffic_wifi_rx", _first_present(_coerce_int(interfaces.get("wifi2_rx")), _coerce_int(statistic.get("traffic_any_ap")))),
+            ("traffic_wifi_tx", _first_present(_coerce_int(interfaces.get("wifi2_tx")), _coerce_int(statistic.get("traffic_ap_any")))),
             ("selected_gateway", _coerce_str(_get_path(bmxd, "gateways", "selected"))),
             ("preferred_gateway", _coerce_str(_get_path(bmxd, "gateways", "preferred"))),
             ("connections_count", len(connections) if isinstance(connections, list) else None),

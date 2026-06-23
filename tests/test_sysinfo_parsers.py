@@ -256,3 +256,25 @@ class SysinfoParserTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TrafficZeroTests(unittest.TestCase):
+    def test_zero_wifi_traffic_is_kept_not_dropped(self) -> None:
+        # Offloader: wifi2_rx/tx present and "0" must yield 0, not be dropped (the
+        # old `_coerce_int(...) or ...` turned a legit 0 into None).
+        payload = {
+            "version": "17",
+            "timestamp": "1774642113",
+            "data": {
+                "system": {"node_type": "node"},
+                "common": {"node": "1468"},
+                "statistic": {"interfaces": {"wifi2_rx": "0", "wifi2_tx": "0"}},
+            },
+        }
+        result = parse_payload(payload)
+        self.assertEqual(result.stats.get("traffic_wifi_rx"), 0)
+        self.assertEqual(result.stats.get("traffic_wifi_tx"), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

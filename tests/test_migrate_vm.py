@@ -42,5 +42,36 @@ class RenameTest(unittest.TestCase):
         self.assertIsNone(migrate_vm.transform_line(b"  "))
 
 
+class DownsampleTest(unittest.TestCase):
+    def test_keeps_last_sample_per_bucket(self) -> None:
+        # interval 300s = 300000 ms; samples at 0s, 60s, 240s (bucket 0) and 360s (bucket 1)
+        values = [10, 11, 12, 20]
+        timestamps = [0, 60_000, 240_000, 360_000]
+        vals, ts = migrate_vm.downsample(values, timestamps, 300_000)
+        # bucket 0 -> last sample (240s, 12), bucket 1 -> (360s, 20)
+        self.assertEqual(ts, [240_000, 360_000])
+        self.assertEqual(vals, [12, 20])
+
+    def test_transform_line_downsamples(self) -> None:
+        line = json.dumps(
+            {
+                "metric": {"__name__": "node_clients.total", "nodeid": "1"},
+                "values": [1, 2, 3],
+                "timestamps": [0, 100_000, 360_000],
+            }
+        ).encode()
+        obj = json.loads(migrate_vm.transform_line(line, 300_000))
+        self.assertEqual(obj["metric"]["__name__"], "node_clients_total")
+        self.assertEqual(obj["timestamps"], [100_000, 360_000])
+        self.assertEqual(obj["values"], [2, 3])
+
+    def test_interval_zero_keeps_all(self) -> None:
+        line = json.dumps(
+            {"metric": {"__name__": "x", "a": "b"}, "values": [1, 2], "timestamps": [0, 1000]}
+        ).encode()
+        obj = json.loads(migrate_vm.transform_line(line, 0))
+        self.assertEqual(obj["values"], [1, 2])
+
+
 if __name__ == "__main__":
     unittest.main()
