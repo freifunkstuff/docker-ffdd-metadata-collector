@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.parse import unquote_plus
@@ -57,7 +58,8 @@ def _coerce_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
     try:
-        return float(str(value))
+        number = float(str(value))
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
@@ -82,9 +84,8 @@ def _parse_nbytes(value: Any) -> int | None:
     parts = text.strip().split()
     if not parts:
         return None
-    try:
-        amount = float(parts[0])
-    except ValueError:
+    amount = _coerce_float(parts[0])
+    if amount is None:
         return None
     unit = parts[1].lower() if len(parts) > 1 else "b"
     factors = {
@@ -99,15 +100,19 @@ def _parse_nbytes(value: Any) -> int | None:
     factor = factors.get(unit)
     if factor is None:
         return None
-    return int(amount * factor)
+    nbytes = amount * factor
+    return int(nbytes) if math.isfinite(nbytes) else None
 
 
 def _parse_uptime_seconds(value: Any) -> float | None:
     text = _coerce_str(value)
     if not text:
         return None
-    first = text.split()[0]
-    return _coerce_float(first)
+    parts = text.split()
+    if not parts:
+        return None
+    seconds = _coerce_float(parts[0])
+    return seconds if seconds is not None and seconds >= 0 else None
 
 
 def _parse_load_avg5(value: Any) -> float | None:

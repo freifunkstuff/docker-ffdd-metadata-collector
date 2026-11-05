@@ -28,6 +28,9 @@ class StateStore(Protocol):
     def apply_fetch_outcome(self, outcome: FetchOutcome) -> None:
         ...
 
+    def set_next_poll_at(self, node_id: str, next_poll_at: str | None) -> None:
+        ...
+
 
 class YamlBackedMemoryStore:
     def __init__(self, discovery_state_path: Path, node_info_dir: Path, node_status_dir: Path) -> None:
@@ -42,8 +45,14 @@ class YamlBackedMemoryStore:
         self.node_status_dir.mkdir(parents=True, exist_ok=True)
         self._states = {}
         self._load_discovery_state()
+        # Discovery owns the current address; poll files may still describe an
+        # older address. Without discovery, status (the latest poll, including
+        # failures) takes precedence over the last successful info snapshot.
+        discovery_ips = {node_id: state.primary_ip for node_id, state in self._states.items() if state.primary_ip}
         self._load_info_states()
         self._load_status_states()
+        for node_id, primary_ip in discovery_ips.items():
+            self._states[node_id].primary_ip = primary_ip
 
     def merge_discovered_nodes(self, nodes: list[DiscoveredNode], discovered_at: str) -> None:
         for node in nodes:
@@ -76,7 +85,11 @@ class YamlBackedMemoryStore:
             )
             self._states[outcome.node_id] = state
 
-        state.primary_ip = outcome.primary_ip
+        # A discovery update may have changed the address while this request
+        # was in flight. Poll results can fill an unknown address, not replace
+        # the current address used for future polls.
+        if not state.primary_ip:
+            state.primary_ip = outcome.primary_ip
         state.last_fetch_at = outcome.fetched_at
         state.request_history = _append_request_attempt(state.request_history, outcome)
 
@@ -100,6 +113,16 @@ class YamlBackedMemoryStore:
         state.last_failure_at = outcome.fetched_at
         state.consecutive_failures += 1
         state.fetch_error = outcome.error
+        self._write_status_state(state)
+
+    def set_next_poll_at(self, node_id: str, next_poll_at: str | None) -> None:
+        """Persist a scheduling decision, or clear it with None.
+
+        The node must already exist (otherwise KeyError is raised). Returned
+        node states are copies, so callers must use this API to save deadlines.
+        """
+        state = self._states[node_id]
+        state.next_poll_at = next_poll_at
         self._write_status_state(state)
 
     def seed_states(self, seeds: list[NodeState], generated_at: str) -> int:
@@ -206,6 +229,7 @@ class YamlBackedMemoryStore:
             state.primary_ip = _as_optional_str(document.get("primary_ip")) or state.primary_ip
             state.first_seen_at = _as_optional_str(document.get("first_seen_at")) or state.first_seen_at
             state.last_fetch_at = _as_optional_str(document.get("last_fetch_at")) or state.last_fetch_at
+            state.next_poll_at = _as_optional_str(document.get("next_poll_at"))
             state.last_success_at = _as_optional_str(document.get("last_success_at")) or state.last_success_at
             state.last_failure_at = _as_optional_str(document.get("last_failure_at")) or state.last_failure_at
             state.consecutive_failures = int(document.get("consecutive_failures") or state.consecutive_failures)
@@ -250,6 +274,7 @@ class YamlBackedMemoryStore:
             "primary_ip": state.primary_ip,
             "first_seen_at": state.first_seen_at,
             "last_fetch_at": state.last_fetch_at,
+            "next_poll_at": state.next_poll_at,
             "last_success_at": state.last_success_at,
             "last_failure_at": state.last_failure_at,
             "consecutive_failures": state.consecutive_failures,

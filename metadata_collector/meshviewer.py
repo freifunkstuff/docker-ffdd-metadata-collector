@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import unquote_plus
 
 from .models import NodeState
 
@@ -84,14 +84,15 @@ def _build_meshviewer_node(
     info = state.info
     stats = state.stats
     is_gateway = info.get("node_type") == "server"
-    online = state.is_online(now, online_window_seconds) is True
+    last_seen = _last_seen_at(state)
+    online = _timestamp_is_recent(last_seen, now, online_window_seconds)
     node: dict[str, Any] = {
         "node_id": state.node_id,
         "hostname": _build_hostname(info.get("name"), state.node_id),
         "addresses": [state.primary_ip],
         "mac": _generate_mac(state.node_id),
         "firstseen": state.first_seen_at,
-        "lastseen": state.last_seen_for_snapshot(),
+        "lastseen": last_seen.isoformat() if last_seen is not None else None,
         "is_online": online,
         "is_gateway": is_gateway,
     }
@@ -125,7 +126,7 @@ def _build_meshviewer_node(
         node["clients_wifi5"] = clients_5g
         node["clients"] = clients_2g + clients_5g
 
-        uptime = _build_uptime(now, stats.get("uptime_seconds"))
+        uptime = _build_uptime(_parse_optional_timestamp(state.last_success_at), stats.get("uptime_seconds"))
         if uptime is not None:
             node["uptime"] = uptime
 
@@ -170,8 +171,17 @@ def _build_meshviewer_link(link: dict[str, object], now: datetime, online_window
     return item if item["source"] and item["target"] else None
 
 
+def _last_seen_at(state: NodeState) -> datetime | None:
+    # A malformed sample timestamp must not discard valid discovery evidence.
+    timestamps = [
+        timestamp for value in (state.last_source_seen_at, state.last_success_at)
+        if (timestamp := _parse_optional_timestamp(value)) is not None
+    ]
+    return max(timestamps) if timestamps else None
+
+
 def _is_hidden(state: NodeState, now: datetime, hide_temp_after_seconds: float, hide_stale_after_days: float) -> bool:
-    last_seen = state.last_seen_at()
+    last_seen = _last_seen_at(state)
     if last_seen is None:
         return True
     age_seconds = (now - last_seen).total_seconds()
@@ -181,8 +191,8 @@ def _is_hidden(state: NodeState, now: datetime, hide_temp_after_seconds: float, 
 
 
 def _build_hostname(name: object, node_id: str) -> str:
-    text = _decode_urlencoded_text(name)
-    text = text.strip() if text is not None else ""
+    # Contact fields have already been URL-decoded by the sysinfo parser.
+    text = str(name).strip() if name is not None else ""
     return node_id if not text else f"{text} ({node_id})"
 
 
@@ -236,11 +246,15 @@ def _build_gateway(stats: dict[str, Any]) -> str | None:
     return gateway
 
 
-def _build_uptime(now: datetime, uptime_seconds: object) -> str | None:
+def _build_uptime(measured_at: datetime | None, uptime_seconds: object) -> str | None:
     seconds = _coerce_float(uptime_seconds)
-    if seconds is None:
+    if measured_at is None or seconds is None or seconds < 0:
         return None
-    return (now - timedelta(seconds=seconds)).isoformat()
+    try:
+        return (measured_at - timedelta(seconds=seconds)).isoformat()
+    except (OverflowError, ValueError):
+        # Even finite input can exceed timedelta or datetime's supported range.
+        return None
 
 
 def _build_memory_usage(stats: dict[str, Any]) -> float | None:
@@ -249,7 +263,7 @@ def _build_memory_usage(stats: dict[str, Any]) -> float | None:
     if mem_total in (None, 0.0) or mem_free is None:
         return None
     usage = 1.0 - (mem_free / mem_total)
-    return round(usage, 6)
+    return round(usage, 6) if math.isfinite(usage) else None
 
 
 def _normalize_tq(value: object) -> float | None:
@@ -316,7 +330,7 @@ def _parse_optional_timestamp(value: object) -> datetime | None:
         return None
     try:
         return _parse_timestamp(str(value))
-    except ValueError:
+    except (ValueError, OverflowError, OSError):
         return None
 
 
@@ -333,7 +347,8 @@ def _coerce_float(value: object) -> float | None:
     if value in (None, ""):
         return None
     try:
-        return float(str(value))
+        number = float(str(value))
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
@@ -341,12 +356,6 @@ def _coerce_float(value: object) -> float | None:
 def _set_if(target: dict[str, Any], key: str, value: object) -> None:
     if value is not None:
         target[key] = value
-
-
-def _decode_urlencoded_text(value: object) -> str | None:
-    if value in (None, ""):
-        return None if value is None else ""
-    return unquote_plus(str(value))
 
 
 def _collect_community_slugs(states: list[NodeState]) -> list[str]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -98,17 +99,34 @@ def write_published_json_atomic(runtime_path: Path, published_path: Path, docume
     published_path = Path(published_path)
     runtime_path.parent.mkdir(parents=True, exist_ok=True)
     published_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=runtime_path.parent, delete=False) as handle:
-        json.dump(document, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        temp_path = Path(handle.name)
-    os.chmod(temp_path, 0o644)
-    if runtime_path.is_symlink():
-        runtime_path.unlink()
-    temp_path.replace(runtime_path)
-    _replace_symlink_atomic(published_path, runtime_path)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=runtime_path.parent, delete=False) as handle:
+            temp_path = Path(handle.name)
+            # Older persisted YAML can contain float NaN/Infinity even after the
+            # parser is fixed. Publish strict JSON, not JavaScript-invalid NaN.
+            json.dump(_json_safe(document), handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, 0o644)
+        if runtime_path.is_symlink():
+            runtime_path.unlink()
+        temp_path.replace(runtime_path)
+        _replace_symlink_atomic(published_path, runtime_path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _merge_links(states: list[NodeState]) -> list[dict[str, object]]:

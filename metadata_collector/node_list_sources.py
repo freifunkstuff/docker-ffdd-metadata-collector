@@ -107,7 +107,7 @@ def parse_node_list_payload(payload: Any) -> list[DiscoveredNode]:
         if isinstance(bmxd, dict):
             _extract_from_iterable(bmxd.get("originators", []), add_node, "bmxd.originators")
 
-    return sorted(nodes_by_id.values(), key=lambda item: int(item.node_id) if item.node_id.isdigit() else item.node_id)
+    return sorted(nodes_by_id.values(), key=lambda item: (0, int(item.node_id)) if item.node_id.isdigit() else (1, item.node_id))
 
 
 def _extract_from_iterable(items: Iterable[Any], add_node: Any, source: str) -> None:

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 
 from .config import MetadataCollectorConfig
@@ -52,15 +53,18 @@ class MetadataCollectorApp:
         )
         logger.info("parallel fetches=%s", self.config.fetch_concurrency)
         self._log_loaded_persistence_summary()
-        await self._write_outputs(reason="startup-persistence")
-        await self._run_discovery_once(initial=True)
-        await self._write_outputs(reason="startup-discovery")
+        await self._try_write_outputs(reason="startup-persistence")
+        try:
+            await self._run_discovery_once(initial=True)
+        except Exception:
+            logger.exception("initial discovery failed; retrying in background")
+        await self._try_write_outputs(reason="startup-discovery")
 
         tasks = [
-            asyncio.create_task(self._discovery_loop(), name="discovery-loop"),
-            asyncio.create_task(self._poll_loop(), name="poll-loop"),
-            asyncio.create_task(self._snapshot_loop(), name="snapshot-loop"),
-            asyncio.create_task(self._summary_loop(), name="summary-loop"),
+            asyncio.create_task(self._supervise("discovery", self._discovery_loop), name="discovery-loop"),
+            asyncio.create_task(self._supervise("poll", self._poll_loop), name="poll-loop"),
+            asyncio.create_task(self._supervise("snapshot", self._snapshot_loop), name="snapshot-loop"),
+            asyncio.create_task(self._supervise("summary", self._summary_loop), name="summary-loop"),
         ]
         if self.exporter is not None:
             logger.info(
@@ -69,18 +73,40 @@ class MetadataCollectorApp:
                 self.config.metrics_interval_seconds,
                 ",".join(self.config.metrics_communities) or "all",
             )
-            tasks.append(asyncio.create_task(self._metrics_loop(), name="metrics-loop"))
+            tasks.append(asyncio.create_task(self._supervise("metrics", self._metrics_loop), name="metrics-loop"))
+        stop_task = asyncio.create_task(self._stop_event.wait(), name="stop-waiter")
         try:
-            await self._stop_event.wait()
+            done, _ = await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
+            if stop_task not in done:
+                failed_task = next(task for task in tasks if task in done)
+                # Ordinary exceptions are retried by _supervise. If a worker
+                # nevertheless exits/cancels, terminate rather than hang alive.
+                await failed_task
+                raise RuntimeError(f"background task stopped: {failed_task.get_name()}")
         finally:
-            for task in tasks:
+            for task in [*tasks, stop_task]:
                 task.cancel()
-            for task in tasks:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            await asyncio.gather(*tasks, stop_task, return_exceptions=True)
             self._remove_signal_handlers()
             self._log_summary()
             logger.info("collector stopped")
+
+    async def _supervise(self, name: str, run_loop: Callable[[], Awaitable[None]]) -> None:
+        while True:
+            try:
+                await run_loop()
+                raise RuntimeError(f"{name} loop returned unexpectedly")
+            except Exception:
+                logger.exception("background loop failed; restarting loop=%s", name)
+                await asyncio.sleep(1.0)
+
+    async def _try_write_outputs(self, reason: str | None = None) -> bool:
+        try:
+            await self._write_outputs(reason=reason)
+        except Exception:
+            logger.exception("output publication failed; retrying on next snapshot reason=%s", reason)
+            return False
+        return True
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -213,17 +239,21 @@ class MetadataCollectorApp:
             self.store.apply_fetch_outcome(outcome)
             refreshed_state = self.store.get_node_state(node_id) or state
             next_poll_at = compute_next_poll_at(self.config, refreshed_state, outcome, now)
-            refreshed_state.next_poll_at = next_poll_at.isoformat()
+            self.store.set_next_poll_at(node_id, next_poll_at.isoformat())
             self._schedule_node(node_id, next_poll_at)
         except Exception:
             retry_at = _utcnow() + timedelta(seconds=self.config.poll_interval_slow_seconds)
             logger.exception("poll failed node_id=%s primary_ip=%s retry_at=%s", node_id, state.primary_ip, retry_at.isoformat())
+            try:
+                self.store.set_next_poll_at(node_id, retry_at.isoformat())
+            except Exception:
+                logger.exception("failed to persist poll retry node_id=%s", node_id)
             self._schedule_node(node_id, retry_at)
 
     async def _snapshot_loop(self) -> None:
         while True:
             await asyncio.sleep(self.config.snapshot_interval_seconds)
-            await self._write_outputs()
+            await self._try_write_outputs()
 
     async def _summary_loop(self) -> None:
         while True:
@@ -298,7 +328,12 @@ class MetadataCollectorApp:
                     community_document,
                 )
             )
-        await asyncio.gather(*publish_tasks)
+        # Wait for all writers even when one fails. Otherwise to_thread writes
+        # may outlive this generation and race the next snapshot after a retry.
+        results = await asyncio.gather(*publish_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
         if reason is not None:
             logger.info(
                 "outputs written reason=%s nodes=%s node_metadata_path=%s status_path=%s meshviewer_path=%s meshviewer_communities=%s",
@@ -412,7 +447,10 @@ def _utcnow() -> datetime:
 def _parse_or_now(value: str | None, fallback: datetime) -> datetime:
     if not value:
         return fallback
-    parsed = datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return fallback

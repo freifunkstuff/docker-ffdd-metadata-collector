@@ -89,6 +89,9 @@ class FakeStore:
     def apply_fetch_outcome(self, outcome: FetchOutcome) -> None:
         return None
 
+    def set_next_poll_at(self, node_id: str, next_poll_at: str | None) -> None:
+        self._states[node_id].next_poll_at = next_poll_at
+
 
 class ScaffoldTests(unittest.TestCase):
     def test_parse_node_list_payload_from_bmxd_snapshot(self) -> None:
@@ -711,7 +714,7 @@ class ScaffoldTests(unittest.TestCase):
                     last_source_seen_at="2025-01-01T00:09:00+00:00",
                     last_success_at="2025-01-01T00:09:30+00:00",
                     info={
-                        "name": "Glas+%26+Bohne",
+                        "name": "Glas & Bohne",
                         "community": "Leipzig",
                         "group": "A",
                         "contact_email": "a@example.invalid",
@@ -804,7 +807,7 @@ class ScaffoldTests(unittest.TestCase):
         self.assertEqual(3, alpha["clients_wifi24"])
         self.assertEqual(4, alpha["clients_wifi5"])
         self.assertEqual("gw-a (gw-b)", alpha["gateway"])
-        self.assertEqual("2025-01-01T00:08:00+00:00", alpha["uptime"])
+        self.assertEqual("2025-01-01T00:07:30+00:00", alpha["uptime"])
         self.assertEqual(0.75, alpha["memory_usage"])
         self.assertEqual({"base": "OpenWrt", "release": "1.2.3"}, alpha["firmware"])
         self.assertEqual({"enabled": True, "branch": "stable"}, alpha["autoupdater"])
