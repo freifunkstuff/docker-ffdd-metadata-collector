@@ -64,6 +64,16 @@ def _coerce_float(value: Any) -> float | None:
         return None
 
 
+def _resource_number(value: Any) -> int | float | None:
+    """JSON resource numbers only: unknown/invalid is never a fabricated zero."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return value if value >= 0 and math.isfinite(value) else None
+    except OverflowError:
+        return None
+
+
 def _parse_bool(value: Any) -> bool | None:
     if value is None or value == "":
         return None
@@ -329,6 +339,15 @@ class GenericSysinfoParser:
                 info[key] = value
                 field_sources.setdefault(key, source)
 
+        if firmware.get("name") == "dockernode":
+            # Firmware identity is independent from the Alpine base OS. Meshviewer
+            # joins release/base; appending DISTRIB_DESCRIPTION would mislabel it.
+            info.pop("firmware_base", None)
+            field_sources.pop("firmware_base", None)
+            info["firmware_name"] = "dockernode"
+            _set_if(info, "os_description", _coerce_str(firmware.get("DISTRIB_DESCRIPTION")))
+            _set_if(info, "os_release", _coerce_str(firmware.get("DISTRIB_RELEASE")))
+
         interfaces = statistic.get("interfaces") if isinstance(statistic.get("interfaces"), dict) else {}
         details = _get_path(statistic, "network", "details")
         details = details if isinstance(details, dict) else {}
@@ -357,6 +376,53 @@ class GenericSysinfoParser:
             ("traffic_shaping_outgoing", _coerce_str(traffic_shaping.get("outgoing")) if isinstance(traffic_shaping, dict) else None),
         ]:
             _set_if(stats, key, value)
+
+        # Only a recognized scope makes the optional resource contract authoritative.
+        resources = data.get("resources")
+        if isinstance(resources, dict) and resources.get("scope") in ("container", "host"):
+            scope = resources["scope"]
+            info["resource_scope"] = scope
+            if scope == "container":
+                # Legacy values may describe the host. Unknown container values
+                # must remain unknown rather than silently crossing scopes.
+                info.pop("cpu_count", None)
+                field_sources.pop("cpu_count", None)
+                for key in ("load_avg_5", "mem_total", "mem_free", "uptime_seconds"):
+                    stats.pop(key, None)
+                    field_sources.pop(key, None)
+            for source, target in (
+                ("cpu_capacity", "cpu_capacity"),
+                ("cpu_total_seconds", "cpu_usage_seconds_total"),
+                ("cpu_user_seconds", "cpu_user_seconds_total"),
+                ("cpu_system_seconds", "cpu_system_seconds_total"),
+                ("cpu_throttled_seconds", "cpu_throttled_seconds_total"),
+                ("cpu_nr_periods", "cpu_periods_total"),
+                ("cpu_nr_throttled", "cpu_throttled_periods_total"),
+                ("memory_limit_bytes", "mem_total"),
+                ("memory_remaining_bytes", "mem_free"),
+                ("memory_current_bytes", "memory_used_bytes"),
+                ("memory_cache_bytes", "memory_cache_bytes"),
+                ("uptime_seconds", "uptime_seconds"),
+            ):
+                value = _resource_number(resources.get(source))
+                if value is not None and (source != "cpu_capacity" or value > 0):
+                    stats[target] = value
+                    field_sources[target] = f"data.resources.{source}"
+            count = _resource_number(resources.get("cpu_count"))
+            if count is not None and count > 0 and count == int(count):
+                count_key = "cpu_allowed_count" if scope == "container" else "cpu_count"
+                info[count_key] = int(count)
+                field_sources[count_key] = "data.resources.cpu_count"
+            if scope == "container" and "cpu_capacity" in stats:
+                info["cpu_count"] = math.ceil(stats["cpu_capacity"])
+                field_sources["cpu_count"] = "data.resources.cpu_capacity"
+            if scope == "container":
+                # No host load fallback, even when all optional fields are absent.
+                stats.pop("load_avg_5", None)
+            else:
+                load = resources.get("load_average")
+                if isinstance(load, (list, tuple)) and len(load) == 3:
+                    _set_if(stats, "load_avg_5", _resource_number(load[1]))
 
         for prefix, airtime_values in (("airtime_2g", airtime_2g), ("airtime_5g", airtime_5g)):
             for suffix, value in airtime_values.items():

@@ -132,6 +132,13 @@ class VictoriametricsExporter:
             ("node_memory_total", stats.get("mem_total")),
             ("node_memory_available", stats.get("mem_free")),
         ]
+        # Additive series only; existing label sets remain byte-for-byte stable.
+        for key in (
+            "cpu_usage_seconds_total", "cpu_user_seconds_total", "cpu_system_seconds_total",
+            "cpu_capacity", "cpu_throttled_seconds_total", "cpu_periods_total",
+            "cpu_throttled_periods_total", "memory_used_bytes", "memory_cache_bytes",
+        ):
+            metrics.append((f"node_{key}", stats.get(key)))
         for band in ("2g", "5g"):
             for suffix in _AIRTIME_SUFFIXES:
                 metrics.append((f"node_memory_airtime_{band}_{suffix}", stats.get(f"airtime_{band}_{suffix}")))

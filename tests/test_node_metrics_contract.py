@@ -30,7 +30,7 @@ class NodeMetricsContractTests(unittest.TestCase):
         cls.producer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.producer)
 
-    def render(self, node_type):
+    def render(self, node_type, resource_snapshot=None):
         # Explicit config works with the Docker 1.0.1 base too: this is a renderer
         # contract, not a dependency on a newer NODE_TYPE environment schema.
         config = {'system': {'node_type': node_type, 'autoupdate': False},
@@ -49,10 +49,20 @@ class NodeMetricsContractTests(unittest.TestCase):
                  '_read_interface_stats': {'tbb_wg_rx': '123456789', 'tbb_wg_tx': '987654321', 'tbb_fastd_rx': '0'}}
         with ExitStack() as stack:
             stack.enter_context(patch.dict(os.environ, {'SYSINFO_MODEL': 'fallback', 'SYSINFO_MODEL2': 'Offloader Model', 'NODE_TYPE': node_type}))
+            if hasattr(self.producer, '_resource_snapshot'):
+                snapshot = resource_snapshot or self.producer.ResourceSnapshot(
+                    scope='container', sampled_at=1, cpu_count=8, cpu_capacity=2,
+                    cpu_total_seconds=123, memory_limit_bytes=1024 * 1024,
+                    memory_current_bytes=512 * 1024, memory_remaining_bytes=512 * 1024,
+                    uptime_seconds=120)
+                stack.enter_context(patch.object(self.producer, '_resource_snapshot', return_value=snapshot))
             for name, value in mocks.items():
                 # Stable base 1.0.1 predates publishing the WG public key.
                 # Counter/role contracts do not require that optional API.
-                if name == '_wireguard_pubkey' and not hasattr(self.producer, name):
+                if not hasattr(self.producer, name):
+                    continue
+                if hasattr(self.producer, '_resource_snapshot') and name in (
+                        '_effective_meminfo', '_container_uptime_seconds', '_read_uptime_raw'):
                     continue
                 stack.enter_context(patch.object(self.producer, name, return_value=value))
             return self.producer.render_stub_payload(config, state, {'bmxd': {'links': [], 'gateways': {'selected': '', 'preferred': '', 'gateways': []}, 'info': []}})
