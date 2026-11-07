@@ -254,6 +254,40 @@ class SysinfoParserTests(unittest.TestCase):
         self.assertEqual("Cafe+Router", result.info["note"])
 
 
+    def test_linux_meminfo_uses_kib_without_changing_other_units(self):
+        from metadata_collector.sysinfo_parsers import _parse_nbytes
+        result = parse_payload(self.make_payload())
+        self.assertEqual(result.stats["mem_total"], 122124 * 1024)
+        self.assertEqual(result.stats["mem_free"], 69192 * 1024)
+        for value, expected in [("2 kB", 2000), ("2 KiB", 2048), ("2 MB", 2000000), ("7", 7)]:
+            self.assertEqual(_parse_nbytes(value), expected)
+        self.assertIsNone(_parse_nbytes("bad kB", linux_meminfo=True))
+
+    def test_nested_server_backbone_details_and_flat_zero_precedence(self):
+        details = {"backbone_mesh_wg_rx": "101", "backbone_mesh_wg_tx": "202",
+                   "backbone_mesh_fastd_rx": "0", "backbone_mesh_fastd_tx": "303"}
+        for version in ("16", "17", "18"):
+            with self.subTest(version=version):
+                statistic = {"network": {"details": details, "backbone_mesh_rx": "999999",
+                                         "wan_rx": "888888", "vpn_rx": "777777"}}
+                result = parse_payload(self.make_payload(version=version, node_type="server", statistic=statistic))
+                self.assertEqual({k: result.stats[k] for k in result.stats if k.startswith("traffic_backbone")},
+                                 {"traffic_backbone_wg_rx": 101, "traffic_backbone_wg_tx": 202,
+                                  "traffic_backbone_fastd_rx": 0, "traffic_backbone_fastd_tx": 303})
+                self.assertNotIn("server_missing_interfaces_block", result.parse_warnings)
+                statistic["interfaces"] = {"tbb_wg_rx": "0", "tbb_fastd_tx": "9"}
+                result = parse_payload(self.make_payload(version=version, node_type="server", statistic=statistic))
+                self.assertEqual(result.stats["traffic_backbone_wg_rx"], 0)
+                self.assertEqual(result.stats["traffic_backbone_fastd_tx"], 9)
+
+    def test_malformed_nested_details_do_not_hide_missing_interfaces(self):
+        for network in ([], {"details": []}, {"details": {"backbone_mesh_wg_rx": []}},
+                        {"details": {"wan_rx": "99"}}):
+            result = parse_payload(self.make_payload(node_type="server", statistic={"network": network}))
+            self.assertIn("server_missing_interfaces_block", result.parse_warnings)
+            self.assertNotIn("traffic_backbone_wg_rx", result.stats)
+
+
 class TrafficZeroTests(unittest.TestCase):
     def _parse(self, interfaces: dict):
         payload = {

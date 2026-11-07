@@ -77,7 +77,7 @@ def _parse_bool(value: Any) -> bool | None:
     return None
 
 
-def _parse_nbytes(value: Any) -> int | None:
+def _parse_nbytes(value: Any, *, linux_meminfo: bool = False) -> int | None:
     text = _coerce_str(value)
     if not text:
         return None
@@ -97,7 +97,8 @@ def _parse_nbytes(value: Any) -> int | None:
         "gb": 1000**3,
         "gib": 1024**3,
     }
-    factor = factors.get(unit)
+    # /proc/meminfo calls KiB "kB"; do not change generic SI units.
+    factor = 1024 if linux_meminfo and unit == "kb" else factors.get(unit)
     if factor is None:
         return None
     nbytes = amount * factor
@@ -329,22 +330,24 @@ class GenericSysinfoParser:
                 field_sources.setdefault(key, source)
 
         interfaces = statistic.get("interfaces") if isinstance(statistic.get("interfaces"), dict) else {}
+        details = _get_path(statistic, "network", "details")
+        details = details if isinstance(details, dict) else {}
         airtime_2g = _parse_airtime((data.get("airtime") or {}).get("radio2g"))
         airtime_5g = _parse_airtime((data.get("airtime") or {}).get("radio5g"))
 
         for key, value in [
             ("uptime_seconds", _parse_uptime_seconds(system.get("uptime"))),
             ("load_avg_5", _parse_load_avg5(statistic.get("cpu_load"))),
-            ("mem_total", _parse_nbytes(statistic.get("meminfo_MemTotal"))),
-            ("mem_free", _parse_nbytes(statistic.get("meminfo_MemFree"))),
+            ("mem_total", _parse_nbytes(statistic.get("meminfo_MemTotal"), linux_meminfo=True)),
+            ("mem_free", _parse_nbytes(statistic.get("meminfo_MemFree"), linux_meminfo=True)),
             ("clients_2g", _coerce_int(_get_path(statistic, "client2g", "1min"))),
             ("clients_5g", _coerce_int(_get_path(statistic, "client5g", "1min"))),
             ("traffic_wifi_rx", _first_present(_coerce_int(interfaces.get("wifi2_rx")), _coerce_int(statistic.get("traffic_any_ap")))),
             ("traffic_wifi_tx", _first_present(_coerce_int(interfaces.get("wifi2_tx")), _coerce_int(statistic.get("traffic_ap_any")))),
-            ("traffic_backbone_wg_rx", _coerce_int(interfaces.get("tbb_wg_rx"))),
-            ("traffic_backbone_wg_tx", _coerce_int(interfaces.get("tbb_wg_tx"))),
-            ("traffic_backbone_fastd_rx", _coerce_int(interfaces.get("tbb_fastd_rx"))),
-            ("traffic_backbone_fastd_tx", _coerce_int(interfaces.get("tbb_fastd_tx"))),
+            ("traffic_backbone_wg_rx", _first_present(_coerce_int(interfaces.get("tbb_wg_rx")), _coerce_int(details.get("backbone_mesh_wg_rx")))),
+            ("traffic_backbone_wg_tx", _first_present(_coerce_int(interfaces.get("tbb_wg_tx")), _coerce_int(details.get("backbone_mesh_wg_tx")))),
+            ("traffic_backbone_fastd_rx", _first_present(_coerce_int(interfaces.get("tbb_fastd_rx")), _coerce_int(details.get("backbone_mesh_fastd_rx")))),
+            ("traffic_backbone_fastd_tx", _first_present(_coerce_int(interfaces.get("tbb_fastd_tx")), _coerce_int(details.get("backbone_mesh_fastd_tx")))),
             ("selected_gateway", _coerce_str(_get_path(bmxd, "gateways", "selected"))),
             ("preferred_gateway", _coerce_str(_get_path(bmxd, "gateways", "preferred"))),
             ("connections_count", len(connections) if isinstance(connections, list) else None),
@@ -367,7 +370,9 @@ class GenericSysinfoParser:
 
         links = _parse_links(node_id=node_id, timestamp=_coerce_str(payload.get("timestamp")), links_payload=bmxd.get("links"))
 
-        if node_type == "server" and not isinstance(statistic.get("interfaces"), dict):
+        if (node_type == "server" and not isinstance(statistic.get("interfaces"), dict)
+                and not any(_coerce_int(details.get(f"backbone_mesh_{kind}_{direction}")) is not None
+                            for kind in ("wg", "fastd") for direction in ("rx", "tx"))):
             warnings.append("server_missing_interfaces_block")
 
         return ParseResult(
